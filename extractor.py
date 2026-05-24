@@ -246,12 +246,22 @@ async def extract_tasks(
             await browser.close()
 
 
+import re as _re
+
+
 def clean_chunks(chunks: list[Chunk]) -> list[Chunk]:
-    """Убрать шапку 'Впишите правильный ответ.' и подобный мусор. Схлопнуть пробелы."""
+    """Убрать шапку 'Впишите правильный ответ.' и подобный мусор.
+    Схлопнуть internal whitespace, но СОХРАНИТЬ пробелы на краях text-чанков —
+    иначе слипнутся со следующей формулой/чанком.
+    """
     SKIP_PATTERNS = [
+        "Впишите правильный ответ.",
         "Впишите правильный ответ",
+        "Выберите правильный ответ.",
         "Выберите правильный ответ",
+        "Дайте развёрнутый ответ.",
         "Дайте развёрнутый ответ",
+        "Дайте развернутый ответ.",
         "Дайте развернутый ответ",
     ]
     cleaned: list[Chunk] = []
@@ -259,14 +269,16 @@ def clean_chunks(chunks: list[Chunk]) -> list[Chunk]:
         if c.kind == "text":
             v = c.value
             for pat in SKIP_PATTERNS:
-                v = v.replace(pat, "").replace(pat + ".", "")
-            v = " ".join(v.split())  # схлопнуть пробелы и переносы
-            if v:
-                cleaned.append(Chunk(kind="text", value=v + (" " if not v.endswith(" ") else "")))
+                v = v.replace(pat, "")
+            # Схлопнуть множественные whitespace, но не trim'ить края
+            v = _re.sub(r"\s+", " ", v)
+            if v and v != " ":
+                cleaned.append(Chunk(kind="text", value=v))
         else:
             cleaned.append(c)
 
-    # Убрать ведущие break'ы и пустые тексты
-    while cleaned and cleaned[0].kind == "break":
+    # Убрать ведущие break'ы и чисто-пробельные тексты в начале
+    while cleaned and (cleaned[0].kind == "break" or
+                       (cleaned[0].kind == "text" and not cleaned[0].value.strip())):
         cleaned.pop(0)
     return cleaned

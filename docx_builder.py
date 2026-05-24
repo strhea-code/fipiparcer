@@ -100,6 +100,27 @@ def _keep_table_together(table) -> None:
         trPr.append(cs)
 
 
+def _set_table_borders(table) -> None:
+    """Явно прописать рамки со всех 4 сторон + внутренние (на всякий) —
+    «Table Grid» style иногда не отрисовывается во всех ридерах."""
+    tbl = table._tbl
+    tblPr = tbl.find(qn("w:tblPr"))
+    if tblPr is None:
+        tblPr = OxmlElement("w:tblPr")
+        tbl.insert(0, tblPr)
+    for old in tblPr.findall(qn("w:tblBorders")):
+        tblPr.remove(old)
+    tblBorders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        b = OxmlElement(f"w:{edge}")
+        b.set(qn("w:val"), "single")
+        b.set(qn("w:sz"), "8")        # 8 = 1 pt
+        b.set(qn("w:space"), "0")
+        b.set(qn("w:color"), "000000")
+        tblBorders.append(b)
+    tblPr.append(tblBorders)
+
+
 def _set_min_row_height(table, height_cm: float) -> None:
     """Задать минимальную высоту строки (карточка не меньше height_cm)."""
     for row in table.rows:
@@ -107,41 +128,70 @@ def _set_min_row_height(table, height_cm: float) -> None:
         row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
 
 
-def _add_chunks(paragraph, chunks: list[Chunk]) -> None:
-    """Вставить поток chunks в параграф (текст + inline OMath + изображения)."""
+def _add_text_or_math_to_paragraph(paragraph, ch: Chunk) -> None:
+    """Добавить inline-чанк (текст или формула) в параграф."""
+    if ch.kind == "text":
+        if ch.value:
+            paragraph.add_run(ch.value)
+    elif ch.kind == "math":
+        if not ch.mathml:
+            return
+        try:
+            omath_xml = fipi_mathml_to_omath(ch.mathml)
+            wrapped = f'<root xmlns:m="{OMATH_NS}">{omath_xml}</root>'
+            root = etree.fromstring(wrapped.encode("utf-8"))
+            for elem in root:
+                paragraph._p.append(elem)
+        except Exception as e:
+            paragraph.add_run(" [formula?] ")
+            print(f"[builder] math fail: {e}", file=sys.stderr)
+    elif ch.kind == "break":
+        paragraph.add_run().add_break()
+
+
+def _add_chunks_with_images(cell, chunks: list[Chunk], max_img_cm: float) -> None:
+    """Заполнить ячейку: inline-текст/формулы — в одном параграфе, картинки —
+    в отдельных центрированных параграфах между ними. Картинки ограничены
+    по ширине так, чтобы влезали в карточку."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    current = cell.add_paragraph()
     for ch in chunks:
-        if ch.kind == "text":
-            if ch.value:
-                paragraph.add_run(ch.value)
-        elif ch.kind == "math":
-            if not ch.mathml:
-                continue
-            try:
-                omath_xml = fipi_mathml_to_omath(ch.mathml)
-                # Обернуть с явным xmlns:m чтобы lxml распарсил namespace
-                wrapped = (
-                    f'<root xmlns:m="{OMATH_NS}">{omath_xml}</root>'
-                )
-                root = etree.fromstring(wrapped.encode("utf-8"))
-                for elem in root:
-                    paragraph._p.append(elem)
-            except Exception as e:
-                paragraph.add_run(" [formula?] ")
-                print(f"[builder] math fail: {e}", file=sys.stderr)
-        elif ch.kind == "image":
+        if ch.kind == "image":
             if not ch.image_bytes:
                 continue
-            run = paragraph.add_run()
+            # Закрыть текущий inline-параграф (даже если он пустой — пусть будет)
+            p_img = cell.add_paragraph()
+            p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p_img.add_run()
             try:
-                run.add_picture(io.BytesIO(ch.image_bytes), width=Cm(6))
+                # Auto-ресайз: вписать в max_img_cm по ширине, сохраняя пропорции
+                img_w_cm = _fit_image_width_cm(ch.image_bytes, max_img_cm)
+                run.add_picture(io.BytesIO(ch.image_bytes), width=Cm(img_w_cm))
             except Exception as e:
                 print(f"[builder] image fail: {e}", file=sys.stderr)
-        elif ch.kind == "break":
-            paragraph.add_run().add_break()
+            # Открыть новый inline-параграф для последующего текста
+            current = cell.add_paragraph()
+        else:
+            _add_text_or_math_to_paragraph(current, ch)
 
 
-def _fill_card(cell, task: Task, with_answer_squares: bool = True) -> None:
-    """Заполнить ячейку-карточку: Номер, тело задачи, Ответ + квадратики."""
+def _fit_image_width_cm(image_bytes: bytes, max_cm: float) -> float:
+    """Вернуть ширину в см: min(нативная ширина / 100 DPI, max_cm)."""
+    try:
+        from PIL import Image as PILImage
+        img = PILImage.open(io.BytesIO(image_bytes))
+        # 96 DPI — стандарт docx для авторазмера
+        native_cm = img.width / 96 * 2.54
+        return min(native_cm, max_cm)
+    except Exception:
+        return max_cm
+
+
+def _fill_card(cell, task: Task, with_answer_squares: bool = True,
+               max_img_cm: float = 11.0) -> None:
+    """Заполнить ячейку-карточку: Номер, тело задачи (текст+формулы+картинки),
+    Ответ + квадратики."""
     # Удалить дефолтный пустой параграф (python-docx ставит его при создании ячейки)
     for p in list(cell.paragraphs):
         p._p.getparent().remove(p._p)
@@ -152,14 +202,8 @@ def _fill_card(cell, task: Task, with_answer_squares: bool = True) -> None:
     run.bold = True
     run.font.size = Pt(10)
 
-    # 2. Тело задачи
-    body_chunks = clean_chunks(task.content)
-    p_body = cell.add_paragraph()
-    for run_in_body in p_body.runs:
-        pass  # пусто, наполнится add_chunks
-    _add_chunks(p_body, body_chunks)
-    for r in p_body.runs:
-        r.font.size = Pt(11)
+    # 2. Тело задачи — текст и формулы inline, картинки отдельными параграфами
+    _add_chunks_with_images(cell, clean_chunks(task.content), max_img_cm)
 
     # 3. Ответ — слово на отдельной строке, квадратики — на следующей
     if with_answer_squares:
@@ -207,10 +251,13 @@ def build_docx(
         table.style = "Table Grid"
         table.autofit = False
         _set_table_fixed_width(table, card_width_cm)
+        _set_table_borders(table)
         if card_height_cm:
             _set_min_row_height(table, card_height_cm)
         _keep_table_together(table)
-        _fill_card(table.cell(0, 0), task, with_answer_squares=with_answer_squares)
+        _fill_card(table.cell(0, 0), task,
+                   with_answer_squares=with_answer_squares,
+                   max_img_cm=card_width_cm - 2.0)
         # Разделитель — иначе python-docx может склеить соседние таблицы в одну
         doc.add_paragraph()
 
