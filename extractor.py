@@ -63,19 +63,33 @@ EXTRACT_JS = r"""
     }
 
     function mathMLFromMjx(node) {
+        // Лучший вариант: настоящий MathML, который Word можно конвертировать в OMath.
         const mml = node.querySelector('mjx-assistive-mml math');
         if (mml) return mml.outerHTML;
+        return '';
+    }
+
+    function visibleMathText(node) {
+        // На текущем ФИПИ MathJax часто отдаёт CHTML без assistive MathML.
+        // При этом node.innerText содержит нормальный Unicode-текст: 𝑦 = 𝑎𝑥² + ...
+        // Поэтому без MathML лучше вставлять формулу как редактируемый текст,
+        // чем терять её полностью.
+        const txt = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (txt) return txt;
+
+        // Последний fallback: речь MathJax. Она английская, поэтому используем только
+        // если ничего видимого нет.
+        const speech = node.getAttribute('data-semantic-speech-none') || '';
+        return speech.trim();
+    }
+
+    function backgroundImageUrl(el) {
         try {
-            // fallback на TeX-исходник, если MathML внезапно недоступен
-            const allMjx = [...document.querySelectorAll('mjx-container')];
-            const idx = allMjx.indexOf(node);
-            const formulas = MathJax.startup.document.math.toArray
-                ? MathJax.startup.document.math.toArray().map(m => m.math)
-                : [...MathJax.startup.document.math].map(m => m.math);
-            return formulas[idx] || '';
-        } catch (e) {
-            return '';
-        }
+            const bg = window.getComputedStyle(el).backgroundImage || '';
+            const m = bg.match(/url\(["']?(.+?)["']?\)/);
+            if (m && m[1] && m[1] !== 'none') return new URL(m[1], document.baseURI).href;
+        } catch (e) {}
+        return '';
     }
 
     function shouldCaptureElement(el) {
@@ -102,27 +116,41 @@ EXTRACT_JS = r"""
         const tag = node.tagName;
         if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return;
         if (tag === 'INPUT' || tag === 'BUTTON' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+        // Не выкидываем .answer/.qanswer: в ФИПИ в этих блоках часто лежат
+        // варианты 1), 2), 3), а не готовый ответ. Иначе теряются условия
+        // задач вроде 45B944 и 426640. Но служебные блоки ответа/проверки
+        // всё равно не должны попадать в карточку.
         if (node.classList && (
-            node.classList.contains('answer') ||
-            node.classList.contains('qanswer') ||
             node.classList.contains('q_footer') ||
-            node.classList.contains('solution')
+            node.classList.contains('solution') ||
+            node.classList.contains('submit-block') ||
+            node.classList.contains('answer-table') ||
+            node.classList.contains('check-answer') ||
+            node.classList.contains('answer-table-wrapper')
         )) return;
         if (!isVisible(node)) return;
 
         if (tag === 'MJX-CONTAINER') {
-            out.push({kind: 'math', mathml: mathMLFromMjx(node)});
+            const mml = mathMLFromMjx(node);
+            if (mml) out.push({kind: 'math', mathml: mml});
+            else pushText(out, ' ' + visibleMathText(node) + ' ');
             return;
         }
         if (tag === 'IMG') {
-            out.push({kind: 'image', src: node.src, alt: node.alt || ''});
+            const rawSrc = node.currentSrc || node.src || node.getAttribute('data-src') || node.getAttribute('src') || '';
+            const src = rawSrc ? new URL(rawSrc, document.baseURI).href : '';
+            out.push({kind: 'image', src: src, alt: node.alt || ''});
             return;
         }
-        if (tag === 'SVG' || tag === 'CANVAS' || tag === 'OBJECT' || tag === 'EMBED') {
+        if (shouldCaptureElement(node)) {
             const id = 'fipi_capture_' + (++captureSeq);
             node.setAttribute('data-fipi-capture-id', id);
             out.push({kind: 'capture', captureId: id});
             return;
+        }
+        const bgUrl = backgroundImageUrl(node);
+        if (bgUrl) {
+            out.push({kind: 'image', src: bgUrl, alt: ''});
         }
         if (tag === 'BR') {
             out.push({kind: 'break'});
@@ -139,19 +167,15 @@ EXTRACT_JS = r"""
     }
 
     function extractContentNodes(block) {
-        // Берём все содержательные ячейки cell_*, а не только cell_0:
-        // у ФИПИ варианты ответов часто лежат в соседних cell_1/cell_2,
-        // поэтому старый парсер терял пункты 1), 2), 3).
-        let nodes = [...block.querySelectorAll('td')].filter(td => {
-            const cls = td.className || '';
-            return /(^|\s)cell_\d+(\s|$)/.test(cls) && isVisible(td);
-        });
+        // Самое надёжное на текущем ФИПИ — брать основной form checkform<ID> целиком.
+        // Внутри него лежат и условие, и варианты 1), 2), 3), и таблицы с графиками.
+        // Старый вариант брал только td.cell_0, поэтому у 45B944/426640 терялись
+        // варианты, а у FADB4B часть таблицы с коэффициентами/графиками.
+        const mainForm = block.querySelector('form[id^="checkform"]');
+        if (mainForm && isVisible(mainForm)) return [mainForm];
 
-        if (!nodes.length) {
-            nodes = [...block.querySelectorAll('.qtext, .question, .task, .content')].filter(isVisible);
-        }
+        let nodes = [...block.querySelectorAll('.qtext, .question, .task, .content')].filter(isVisible);
         if (!nodes.length) nodes = [block];
-
         return nodes;
     }
 
@@ -353,6 +377,10 @@ def clean_chunks(chunks: list[Chunk]) -> list[Chunk]:
             v = c.value
             for pat in SKIP_PATTERNS:
                 v = v.replace(pat, "")
+            # Убираем служебную инструкцию ФИПИ в конце условия; поле ответа
+            # мы рисуем сами в карточке.
+            v = _re.sub(r"В ответ запишите[^.?!]*(?:[.?!]|$)", "", v, flags=_re.IGNORECASE)
+            v = _re.sub(r"В таблице под каждой буквой укажите[^.?!]*(?:[.?!]|$)", "", v, flags=_re.IGNORECASE)
             # Схлопнуть множественные whitespace, но не trim'ить края
             v = _re.sub(r"\s+", " ", v)
             if v and v != " ":

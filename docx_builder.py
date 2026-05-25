@@ -255,8 +255,13 @@ def is_large_task(task: Task, min_images: int = 2, min_text_chars: int = 900) ->
     """
     cleaned = clean_chunks(task.content)
     image_count = _count_images(cleaned)
-    text_len = len(" ".join(ch.value for ch in cleaned if ch.kind == "text"))
-    return image_count >= min_images or (image_count >= 1 and text_len >= min_text_chars)
+    text = " ".join(ch.value for ch in cleaned if ch.kind == "text")
+    text_len = len(text)
+    text_lower = text.lower()
+    # Даже если графики не удалось распознать как отдельные изображения,
+    # задания на соответствие с графиками лучше держать отдельно от обычных карточек.
+    graph_matching = ("график" in text_lower and ("коэффициент" in text_lower or "установите соответствие" in text_lower))
+    return image_count >= min_images or (image_count >= 1 and text_len >= min_text_chars) or graph_matching
 
 
 def _fill_card(cell, task: Task, with_answer_squares: bool, max_img_cm: float) -> None:
