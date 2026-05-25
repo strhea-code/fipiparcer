@@ -69,18 +69,116 @@ EXTRACT_JS = r"""
         return '';
     }
 
-    function visibleMathText(node) {
-        // На текущем ФИПИ MathJax часто отдаёт CHTML без assistive MathML.
-        // При этом node.innerText содержит нормальный Unicode-текст: 𝑦 = 𝑎𝑥² + ...
-        // Поэтому без MathML лучше вставлять формулу как редактируемый текст,
-        // чем терять её полностью.
-        const txt = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
-        if (txt) return txt;
+    function normalizeMathText(text) {
+        if (!text) return '';
+        return String(text)
+            .normalize('NFKC')
+            .replace(/[\u2061\u2062\u2063\u2064]/g, '')  // невидимые мат. операторы
+            .replace(/[\u2009\u200A\u200B\u202F\u00A0]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .replace(/\s+([,.;:])/g, '$1')
+            .trim();
+    }
 
-        // Последний fallback: речь MathJax. Она английская, поэтому используем только
-        // если ничего видимого нет.
+
+    function polishFormulaText(text) {
+        if (!text) return '';
+        return normalizeMathText(text)
+            .replace(/([A-Za-zА-Яа-я])2\b/g, '$1²')
+            .replace(/\s*([=<>+−\-])\s*/g, ' $1 ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function toSuperscript(text) {
+        const map = {'0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹','+':'⁺','-':'⁻','=':'⁼','(':'⁽',')':'⁾'};
+        const t = normalizeMathText(text);
+        if (!t) return '';
+        if (/^[0-9+\-=()]+$/.test(t)) return [...t].map(ch => map[ch] || ch).join('');
+        return '^(' + t + ')';
+    }
+
+    function mjxText(el) {
+        if (!el) return '';
+        if (el.nodeType === 3) return normalizeMathText(el.textContent || '');
+        if (el.nodeType !== 1) return '';
+
+        const tag = el.tagName;
+        if (tag === 'MJX-ASSISTIVE-MML') return '';
+        if (tag === 'MJX-C') {
+            const raw = el.textContent || '';
+            // MathJax использует эти символы как невидимое умножение/тонкие пробелы.
+            if (/^[\u2061\u2062\u2063\u2064\u2009\u200A\u200B\u202F\u00A0\s]+$/.test(raw)) return '';
+            return normalizeMathText(raw);
+        }
+        if (tag === 'MJX-MO') {
+            const t = normalizeMathText(el.textContent || '');
+            if (!t || t === '⁢') return '';
+            return t;
+        }
+        if (tag === 'MJX-MTEXT') {
+            const t = normalizeMathText(el.textContent || '');
+            // Часто это технический тонкий пробел, а не часть формулы.
+            if (!t) return '';
+            return t;
+        }
+        if (tag === 'MJX-MSUP') {
+            const children = [...el.children].filter(ch => ch.tagName !== 'MJX-ASSISTIVE-MML');
+            const base = children.find(ch => ch.tagName !== 'MJX-SCRIPT') || children[0];
+            const script = children.find(ch => ch.tagName === 'MJX-SCRIPT') || children[1];
+            return mjxText(base) + toSuperscript(mjxText(script));
+        }
+        if (tag === 'MJX-MSUB') {
+            const children = [...el.children].filter(ch => ch.tagName !== 'MJX-ASSISTIVE-MML');
+            const base = children.find(ch => ch.tagName !== 'MJX-SCRIPT') || children[0];
+            const script = children.find(ch => ch.tagName === 'MJX-SCRIPT') || children[1];
+            const sub = normalizeMathText(mjxText(script));
+            return mjxText(base) + (sub ? '_' + sub : '');
+        }
+        if (tag === 'MJX-MFRAC') {
+            const kids = [...el.children];
+            const num = mjxText(kids[0]);
+            const den = mjxText(kids[1]);
+            return den ? '(' + num + ')/(' + den + ')' : num;
+        }
+        if (tag === 'MJX-BREAK') return ' ';
+
+        let parts = [];
+        for (const ch of el.childNodes) {
+            const t = mjxText(ch);
+            if (t) parts.push(t);
+        }
+        let joined = parts.join(' ');
+        joined = joined
+            .replace(/\s*([=<>+−\-])\s*/g, ' $1 ')
+            .replace(/\s+/g, ' ')
+            .replace(/([A-Za-zА-Яа-я])\s+([A-Za-zА-Яа-я])/g, '$1$2')
+            .replace(/\s+([²³¹⁰⁴⁵⁶⁷⁸⁹])/g, '$1')
+            .trim();
+        return joined;
+    }
+
+    function visibleMathText(node) {
+        // На ФИПИ MathJax часто отдает CHTML без assistive MathML.
+        // innerText копируется правильно, но в Word символы 𝑎, 𝑥, ⁢ могут
+        // отображаться пустыми местами. Поэтому восстанавливаем формулу из
+        // mjx-тегов и сразу приводим её к обычному редактируемому тексту.
+        const structured = mjxText(node);
+        if (structured) return polishFormulaText(structured);
+
+        const txt = normalizeMathText(node.innerText || node.textContent || '');
+        if (txt) return polishFormulaText(txt);
+
         const speech = node.getAttribute('data-semantic-speech-none') || '';
-        return speech.trim();
+        return normalizeMathText(speech)
+            .replace(/ equals /g, ' = ')
+            .replace(/ plus /g, ' + ')
+            .replace(/ less than /g, ' < ')
+            .replace(/ greater than /g, ' > ')
+            .replace(/ squared/g, '²')
+            .replace(/ empty/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
     }
 
     function backgroundImageUrl(el) {
@@ -103,7 +201,9 @@ EXTRACT_JS = r"""
 
     function pushText(out, text) {
         if (!text) return;
-        out.push({kind: 'text', value: text});
+        const value = normalizeMathText(text);
+        if (!value) return;
+        out.push({kind: 'text', value: value});
     }
 
     function walk(node, out) {

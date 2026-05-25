@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+import re
 import sys
 from pathlib import Path
 
@@ -29,6 +30,12 @@ A4_LANDSCAPE_HEIGHT_CM = 21.0
 PAGE_MARGIN_CM = 1.0
 CARD_WIDTH_CM = 13.0
 SECTION_GAP_CM = 0.5
+
+# Настройки компактного печатного макета. Их удобно менять дальше.
+BODY_FONT_SIZE_PT = 9.0
+HEADER_FONT_SIZE_PT = 9.0
+ANSWER_FONT_SIZE_PT = 9.5
+ANSWER_SQUARES_WIDTH_CM = 5.8
 
 # 0 = автоматическая высота по контенту; 4/6 = ориентир для печати на A4.
 CARD_HEIGHT_BY_PER_PAGE: dict[int, float | None] = {0: None, 4: 9.0, 6: 6.0}
@@ -104,7 +111,7 @@ def _set_table_borders(table) -> None:
     tblPr.append(tblBorders)
 
 
-def _set_cell_margins(cell, top=0.07, start=0.12, bottom=0.07, end=0.12) -> None:
+def _set_cell_margins(cell, top=0.05, start=0.10, bottom=0.05, end=0.10) -> None:
     tcPr = cell._tc.get_or_add_tcPr()
     tcMar = tcPr.first_child_found_in("w:tcMar")
     if tcMar is None:
@@ -151,7 +158,7 @@ def _paragraph_border(paragraph, where: str = "bottom") -> None:
     border.set(qn("w:color"), "000000")
 
 
-def _format_paragraph(paragraph, font_size_pt: float = 10.5) -> None:
+def _format_paragraph(paragraph, font_size_pt: float = BODY_FONT_SIZE_PT) -> None:
     paragraph.paragraph_format.space_before = Pt(0)
     paragraph.paragraph_format.space_after = Pt(0)
     paragraph.paragraph_format.line_spacing = 1.0
@@ -166,12 +173,51 @@ def _clear_cell(cell) -> None:
         p._p.getparent().remove(p._p)
 
 
+def _needs_space_between(left: str, right: str) -> bool:
+    """Нужен ли пробел между соседними текстовыми фрагментами.
+
+    ФИПИ часто отдаёт текст и MathJax отдельными DOM-узлами: «вида» +
+    «y = ax² + bx + c» или «коэффициентов» + «a» + «и» + «c».
+    При нормализации краевые пробелы теряются, поэтому в Word получалось
+    «видаy» и «коэффициентовaиc».
+    """
+    if not left or not right:
+        return False
+    if left[-1].isspace() or right[0].isspace():
+        return False
+    if right[0] in ",.;:!?)]}»":
+        return False
+    if left[-1] in "([{«":
+        return False
+    return True
+
+
+def _prettify_inline_text(text: str) -> str:
+    """Небольшая чистка текста перед вставкой в Word.
+
+    ФИПИ/MathJax иногда отдаёт квадрат как обычную цифру: x2.
+    Для печатных карточек делаем читаемый вариант x².
+    """
+    if not text:
+        return text
+    text = re.sub(r"(?<=[A-Za-zА-Яа-я])2(?=\s|$|[+\-−=.,;:)])", "²", text)
+    return text
+
+
+def _add_text_run(paragraph, text: str) -> None:
+    if not text:
+        return
+    value = _prettify_inline_text(text)
+    if _needs_space_between(paragraph.text, value):
+        value = " " + value
+    run = paragraph.add_run(value)
+    run.font.name = "Times New Roman"
+    run.font.size = Pt(BODY_FONT_SIZE_PT)
+
+
 def _add_text_or_math_to_paragraph(paragraph, ch: Chunk) -> None:
     if ch.kind == "text":
-        if ch.value:
-            run = paragraph.add_run(ch.value)
-            run.font.name = "Times New Roman"
-            run.font.size = Pt(10.5)
+        _add_text_run(paragraph, ch.value)
     elif ch.kind == "math":
         if not ch.mathml:
             return
@@ -180,9 +226,7 @@ def _add_text_or_math_to_paragraph(paragraph, ch: Chunk) -> None:
             # Если MathML недоступен и пришёл TeX-текст, не теряем формулу,
             # а вставляем её как редактируемый текст.
             if not ch.mathml.lstrip().startswith("<"):
-                run = paragraph.add_run(ch.mathml)
-                run.font.name = "Times New Roman"
-                run.font.size = Pt(10.5)
+                _add_text_run(paragraph, ch.mathml)
                 return
             omath_xml = fipi_mathml_to_omath(ch.mathml)
             wrapped = f'<root xmlns:m="{OMATH_NS}">{omath_xml}</root>'
@@ -190,7 +234,7 @@ def _add_text_or_math_to_paragraph(paragraph, ch: Chunk) -> None:
             for elem in root:
                 paragraph._p.append(elem)
         except Exception as e:
-            paragraph.add_run(ch.mathml if ch.mathml else " [formula?] ")
+            _add_text_run(paragraph, ch.mathml if ch.mathml else "[formula?]")
             print(f"[builder] math fail: {e}", file=sys.stderr)
     elif ch.kind == "break":
         paragraph.add_run().add_break()
@@ -275,7 +319,7 @@ def _fill_card(cell, task: Task, with_answer_squares: bool, max_img_cm: float) -
     run = p_num.add_run(f"Номер: {task.qid}")
     run.bold = True
     run.font.name = "Times New Roman"
-    run.font.size = Pt(10)
+    run.font.size = Pt(HEADER_FONT_SIZE_PT)
     _paragraph_border(p_num, "bottom")
 
     # Тело задания: редактируемый текст, OMath-формулы, картинки.
@@ -297,10 +341,10 @@ def _fill_card(cell, task: Task, with_answer_squares: bool, max_img_cm: float) -
         run_lbl = p_ans.add_run("Ответ:   ")
         run_lbl.bold = True
         run_lbl.font.name = "Times New Roman"
-        run_lbl.font.size = Pt(11)
+        run_lbl.font.size = Pt(ANSWER_FONT_SIZE_PT)
         run_img = p_ans.add_run()
         try:
-            run_img.add_picture(str(ASSETS_DIR / "answer_squares.png"), width=Cm(7.6))
+            run_img.add_picture(str(ASSETS_DIR / "answer_squares.png"), width=Cm(ANSWER_SQUARES_WIDTH_CM))
         except Exception as e:
             print(f"[builder] answer-squares fail: {e}", file=sys.stderr)
 
