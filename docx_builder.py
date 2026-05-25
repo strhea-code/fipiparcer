@@ -32,6 +32,10 @@ SECTION_GAP_CM = 0.5
 
 # 0 = автоматическая высота по контенту; 4/6 = ориентир для печати на A4.
 CARD_HEIGHT_BY_PER_PAGE: dict[int, float | None] = {0: None, 4: 9.0, 6: 6.0}
+# Крупные задания с несколькими картинками не должны разрывать карточку между страницами.
+# Поэтому для задач с 2+ изображениями дополнительно ограничиваем высоту каждой картинки.
+MULTI_IMAGE_MAX_HEIGHT_CM = 4.1
+SINGLE_IMAGE_MAX_HEIGHT_CM = 6.2
 ASSETS_DIR = Path(__file__).parent / "assets"
 
 
@@ -151,6 +155,7 @@ def _format_paragraph(paragraph, font_size_pt: float = 10.5) -> None:
     paragraph.paragraph_format.space_before = Pt(0)
     paragraph.paragraph_format.space_after = Pt(0)
     paragraph.paragraph_format.line_spacing = 1.0
+    paragraph.paragraph_format.keep_together = True
     for run in paragraph.runs:
         run.font.name = "Times New Roman"
         run.font.size = Pt(font_size_pt)
@@ -171,19 +176,27 @@ def _add_text_or_math_to_paragraph(paragraph, ch: Chunk) -> None:
         if not ch.mathml:
             return
         try:
+            # В норме extractor отдаёт настоящий MathML из mjx-assistive-mml.
+            # Если MathML недоступен и пришёл TeX-текст, не теряем формулу,
+            # а вставляем её как редактируемый текст.
+            if not ch.mathml.lstrip().startswith("<"):
+                run = paragraph.add_run(ch.mathml)
+                run.font.name = "Times New Roman"
+                run.font.size = Pt(10.5)
+                return
             omath_xml = fipi_mathml_to_omath(ch.mathml)
             wrapped = f'<root xmlns:m="{OMATH_NS}">{omath_xml}</root>'
             root = etree.fromstring(wrapped.encode("utf-8"))
             for elem in root:
                 paragraph._p.append(elem)
         except Exception as e:
-            paragraph.add_run(" [formula?] ")
+            paragraph.add_run(ch.mathml if ch.mathml else " [formula?] ")
             print(f"[builder] math fail: {e}", file=sys.stderr)
     elif ch.kind == "break":
         paragraph.add_run().add_break()
 
 
-def _add_chunks_with_images(cell, chunks: list[Chunk], max_img_cm: float) -> None:
+def _add_chunks_with_images(cell, chunks: list[Chunk], max_img_cm: float, max_img_height_cm: float | None = None) -> None:
     current = cell.add_paragraph()
     _format_paragraph(current)
     for ch in chunks:
@@ -196,8 +209,11 @@ def _add_chunks_with_images(cell, chunks: list[Chunk], max_img_cm: float) -> Non
             p_img.paragraph_format.space_after = Pt(2)
             run = p_img.add_run()
             try:
-                img_w_cm = _fit_image_width_cm(ch.image_bytes, max_img_cm)
-                run.add_picture(io.BytesIO(ch.image_bytes), width=Cm(img_w_cm))
+                img_w_cm, img_h_cm = _fit_image_size_cm(ch.image_bytes, max_img_cm, max_img_height_cm)
+                if img_h_cm:
+                    run.add_picture(io.BytesIO(ch.image_bytes), width=Cm(img_w_cm), height=Cm(img_h_cm))
+                else:
+                    run.add_picture(io.BytesIO(ch.image_bytes), width=Cm(img_w_cm))
             except Exception as e:
                 print(f"[builder] image fail: {e}", file=sys.stderr)
             current = cell.add_paragraph()
@@ -206,14 +222,41 @@ def _add_chunks_with_images(cell, chunks: list[Chunk], max_img_cm: float) -> Non
             _add_text_or_math_to_paragraph(current, ch)
 
 
-def _fit_image_width_cm(image_bytes: bytes, max_cm: float) -> float:
+def _fit_image_size_cm(image_bytes: bytes, max_width_cm: float, max_height_cm: float | None = None) -> tuple[float, float | None]:
+    """Вернуть размеры картинки в сантиметрах с сохранением пропорций.
+
+    Ограничение по высоте важно для задач вроде FADB4B, где несколько графиков
+    иначе растягивают карточку на весь лист и Word переносит нижнюю часть на
+    следующую страницу.
+    """
     try:
         from PIL import Image as PILImage
         img = PILImage.open(io.BytesIO(image_bytes))
-        native_cm = img.width / 96 * 2.54
-        return min(native_cm, max_cm)
+        native_w_cm = img.width / 96 * 2.54
+        native_h_cm = img.height / 96 * 2.54
+        scale = min(1.0, max_width_cm / native_w_cm)
+        if max_height_cm:
+            scale = min(scale, max_height_cm / native_h_cm)
+        return native_w_cm * scale, native_h_cm * scale
     except Exception:
-        return max_cm
+        return max_width_cm, None
+
+
+def _count_images(chunks: list[Chunk]) -> int:
+    return sum(1 for ch in chunks if ch.kind == "image" and ch.image_bytes)
+
+
+def is_large_task(task: Task, min_images: int = 2, min_text_chars: int = 900) -> bool:
+    """Вернуть True для карточек, которые лучше вынести в отдельный файл.
+
+    Типичный пример — задания с несколькими графиками/рисунками. Если класть
+    их в общий файл на 6 карточек на лист, Word разрывает карточку между
+    страницами или растягивает её на весь лист.
+    """
+    cleaned = clean_chunks(task.content)
+    image_count = _count_images(cleaned)
+    text_len = len(" ".join(ch.value for ch in cleaned if ch.kind == "text"))
+    return image_count >= min_images or (image_count >= 1 and text_len >= min_text_chars)
 
 
 def _fill_card(cell, task: Task, with_answer_squares: bool, max_img_cm: float) -> None:
@@ -231,7 +274,14 @@ def _fill_card(cell, task: Task, with_answer_squares: bool, max_img_cm: float) -
     _paragraph_border(p_num, "bottom")
 
     # Тело задания: редактируемый текст, OMath-формулы, картинки.
-    _add_chunks_with_images(cell, clean_chunks(task.content), max_img_cm)
+    cleaned = clean_chunks(task.content)
+    image_count = _count_images(cleaned)
+    max_img_height_cm = None
+    if image_count >= 2:
+        max_img_height_cm = MULTI_IMAGE_MAX_HEIGHT_CM
+    elif image_count == 1:
+        max_img_height_cm = SINGLE_IMAGE_MAX_HEIGHT_CM
+    _add_chunks_with_images(cell, cleaned, max_img_cm, max_img_height_cm=max_img_height_cm)
 
     # Ответ с квадратиками в одной строке, как в ручном образце.
     if with_answer_squares:
@@ -311,3 +361,19 @@ def split_by_answer_type(tasks: list[Task]) -> tuple[list[Task], list[Task]]:
     short = [t for t in tasks if t.answer_type != "extended"]
     extended = [t for t in tasks if t.answer_type == "extended"]
     return short, extended
+
+
+def split_large_tasks(tasks: list[Task]) -> tuple[list[Task], list[Task]]:
+    """Разделить короткие карточки на обычные и крупные.
+
+    Крупные карточки лучше сохранять в отдельный docx, чтобы они не ломали
+    раскладку основного файла с 4–6 карточками на лист.
+    """
+    regular: list[Task] = []
+    large: list[Task] = []
+    for task in tasks:
+        if is_large_task(task):
+            large.append(task)
+        else:
+            regular.append(task)
+    return regular, large

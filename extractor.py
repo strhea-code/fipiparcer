@@ -52,62 +52,124 @@ class Task:
 # JS-код для извлечения всех qblock'ов с MathML формулами
 EXTRACT_JS = r"""
 () => {
-    const allMjx = [...document.querySelectorAll('mjx-container')];
-    let formulas = [];
-    try {
-        formulas = MathJax.startup.document.math.toArray
-            ? MathJax.startup.document.math.toArray().map(m => m.math)
-            : [...MathJax.startup.document.math].map(m => m.math);
-    } catch (e) {}
-    const formulaMap = new Map();
-    allMjx.forEach((el, i) => formulaMap.set(el, formulas[i] || ''));
+    let captureSeq = 0;
 
-    function walk(node, out) {
-        if (node.nodeType === 3) {  // TEXT_NODE
-            const t = node.textContent;
-            if (t) out.push({kind: 'text', value: t});
-            return;
-        }
-        if (node.nodeType !== 1) return;  // не ELEMENT_NODE
-        const tag = node.tagName;
-        if (tag === 'MJX-CONTAINER') {
-            out.push({kind: 'math', mathml: formulaMap.get(node) || ''});
-        } else if (tag === 'IMG') {
-            out.push({kind: 'image', src: node.src, alt: node.alt || ''});
-        } else if (tag === 'BR') {
-            out.push({kind: 'break'});
-        } else if (tag === 'SCRIPT' || tag === 'STYLE') {
-            return;
-        } else {
-            for (const child of node.childNodes) walk(child, out);
+    function isVisible(el) {
+        if (!el || !el.isConnected) return false;
+        const st = window.getComputedStyle(el);
+        if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    function mathMLFromMjx(node) {
+        const mml = node.querySelector('mjx-assistive-mml math');
+        if (mml) return mml.outerHTML;
+        try {
+            // fallback на TeX-исходник, если MathML внезапно недоступен
+            const allMjx = [...document.querySelectorAll('mjx-container')];
+            const idx = allMjx.indexOf(node);
+            const formulas = MathJax.startup.document.math.toArray
+                ? MathJax.startup.document.math.toArray().map(m => m.math)
+                : [...MathJax.startup.document.math].map(m => m.math);
+            return formulas[idx] || '';
+        } catch (e) {
+            return '';
         }
     }
 
-    function extractCell(block) {
-        // Основной контент задачи — в первой ячейке td с классом cell_0
-        return block.querySelector('table td.cell_0') || block.querySelector('td.cell_0');
+    function shouldCaptureElement(el) {
+        const tag = el.tagName;
+        if (tag === 'SVG' || tag === 'CANVAS') return true;
+        if (tag === 'OBJECT' || tag === 'EMBED') return true;
+        // Иногда графики/рисунки лежат в блочных контейнерах без IMG, но с SVG/CANVAS внутри.
+        if (el.querySelector && (el.querySelector('svg') || el.querySelector('canvas'))) return true;
+        return false;
+    }
+
+    function pushText(out, text) {
+        if (!text) return;
+        out.push({kind: 'text', value: text});
+    }
+
+    function walk(node, out) {
+        if (node.nodeType === 3) {  // TEXT_NODE
+            pushText(out, node.textContent);
+            return;
+        }
+        if (node.nodeType !== 1) return;  // не ELEMENT_NODE
+
+        const tag = node.tagName;
+        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return;
+        if (tag === 'INPUT' || tag === 'BUTTON' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+        if (node.classList && (
+            node.classList.contains('answer') ||
+            node.classList.contains('qanswer') ||
+            node.classList.contains('q_footer') ||
+            node.classList.contains('solution')
+        )) return;
+        if (!isVisible(node)) return;
+
+        if (tag === 'MJX-CONTAINER') {
+            out.push({kind: 'math', mathml: mathMLFromMjx(node)});
+            return;
+        }
+        if (tag === 'IMG') {
+            out.push({kind: 'image', src: node.src, alt: node.alt || ''});
+            return;
+        }
+        if (tag === 'SVG' || tag === 'CANVAS' || tag === 'OBJECT' || tag === 'EMBED') {
+            const id = 'fipi_capture_' + (++captureSeq);
+            node.setAttribute('data-fipi-capture-id', id);
+            out.push({kind: 'capture', captureId: id});
+            return;
+        }
+        if (tag === 'BR') {
+            out.push({kind: 'break'});
+            return;
+        }
+
+        // Блочные элементы разделяем переносами, чтобы варианты 1), 2), 3) не слипались.
+        const blockTags = new Set(['P', 'DIV', 'TR', 'TABLE', 'UL', 'OL']);
+        if (blockTags.has(tag) && out.length) out.push({kind: 'break'});
+
+        for (const child of node.childNodes) walk(child, out);
+
+        if (blockTags.has(tag)) out.push({kind: 'break'});
+    }
+
+    function extractContentNodes(block) {
+        // Берём все содержательные ячейки cell_*, а не только cell_0:
+        // у ФИПИ варианты ответов часто лежат в соседних cell_1/cell_2,
+        // поэтому старый парсер терял пункты 1), 2), 3).
+        let nodes = [...block.querySelectorAll('td')].filter(td => {
+            const cls = td.className || '';
+            return /(^|\s)cell_\d+(\s|$)/.test(cls) && isVisible(td);
+        });
+
+        if (!nodes.length) {
+            nodes = [...block.querySelectorAll('.qtext, .question, .task, .content')].filter(isVisible);
+        }
+        if (!nodes.length) nodes = [block];
+
+        return nodes;
     }
 
     const blocks = [...document.querySelectorAll('.qblock')];
     return blocks.map(block => {
         const qid = (block.id || '').replace(/^q/, '');
         const guid = block.querySelector('input[name="guid"]')?.value || '';
-        const cell = extractCell(block);
-
         const content = [];
-        if (cell) {
-            // Вытаскиваем содержимое всех ячеек .cell_0 (там может быть несколько — варианты)
-            const cells = [...block.querySelectorAll('td.cell_0')];
-            cells.forEach((c, idx) => {
-                walk(c, content);
-                if (idx < cells.length - 1) content.push({kind: 'break'});
-            });
-        }
 
-        // Тип задачи
+        const nodes = extractContentNodes(block);
+        nodes.forEach((node, idx) => {
+            walk(node, content);
+            if (idx < nodes.length - 1) content.push({kind: 'break'});
+        });
+
         const hasRadio = !!block.querySelector('input[type="radio"]');
         const blockText = block.innerText || '';
-        const isExtended = /развёрн|подроб/i.test(blockText);
+        const isExtended = /развёрн|разверн|подроб/i.test(blockText);
         let answerType = 'short';
         if (hasRadio) answerType = 'choice';
         else if (isExtended) answerType = 'extended';
@@ -133,6 +195,23 @@ async def fetch_image(page, src: str) -> tuple[bytes, str]:
         return await resp.body(), ext
     except Exception as e:
         print(f"[extractor] image fetch failed {src}: {e}", file=sys.stderr)
+        return b"", "png"
+
+
+
+
+async def capture_element_image(page, capture_id: str) -> tuple[bytes, str]:
+    """Сделать PNG-скриншот inline SVG/CANVAS/OBJECT, которые не являются <img>."""
+    if not capture_id:
+        return b"", "png"
+    try:
+        loc = page.locator(f'[data-fipi-capture-id="{capture_id}"]').first
+        if await loc.count() == 0:
+            return b"", "png"
+        data = await loc.screenshot(type="png", timeout=10_000)
+        return data, "png"
+    except Exception as e:
+        print(f"[extractor] capture failed {capture_id}: {e}", file=sys.stderr)
         return b"", "png"
 
 
@@ -218,7 +297,11 @@ async def extract_tasks(
                         elif c["kind"] == "break":
                             chunks.append(Chunk(kind="break"))
                         elif c["kind"] == "image":
-                            data, ext = await fetch_image(page, c["src"])
+                            data, ext = await fetch_image(page, c.get("src", ""))
+                            if data:
+                                chunks.append(Chunk(kind="image", image_bytes=data, image_ext=ext))
+                        elif c["kind"] == "capture":
+                            data, ext = await capture_element_image(page, c.get("captureId", ""))
                             if data:
                                 chunks.append(Chunk(kind="image", image_bytes=data, image_ext=ext))
                     tasks.append(Task(

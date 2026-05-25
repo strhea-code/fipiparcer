@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 from extractor import extract_tasks
-from docx_builder import build_docx, group_tasks, split_by_answer_type
+from docx_builder import build_docx, group_tasks, split_by_answer_type, split_large_tasks
 
 
 PROJ_OGE_MATH = "DE0E276E497AB3784C3FC4CC20248DC0"
@@ -64,18 +64,27 @@ def main(argv: list[str] | None = None) -> int:
 
     tasks = group_tasks(tasks)
     short, extended = split_by_answer_type(tasks)
+    regular, large = split_large_tasks(short)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     short_path = args.out_dir / f"{args.out_name}.docx"
+    large_path = args.out_dir / f"{args.out_name}-large.docx"
     ext_path = args.out_dir / f"{args.out_name}-extended.docx"
 
-    if short:
-        build_docx(short, short_path, with_answer_squares=True, per_page=args.per_page)
+    if regular:
+        build_docx(regular, short_path, with_answer_squares=True, per_page=args.per_page)
+    if large:
+        # Крупные карточки не кладём в общий файл на 6 карточек: они ломают
+        # печатную раскладку. В отдельном файле даём им больше места.
+        build_docx(large, large_path, with_answer_squares=True, per_page=4)
     if extended:
         build_docx(extended, ext_path, with_answer_squares=False, per_page=args.per_page)
 
-    print(f"[main] готово: {len(short)} коротких, {len(extended)} развёрнутых",
-          file=sys.stderr)
+    print(
+        f"[main] готово: {len(regular)} коротких, {len(large)} крупных, "
+        f"{len(extended)} развёрнутых",
+        file=sys.stderr,
+    )
     return 0
 
 
