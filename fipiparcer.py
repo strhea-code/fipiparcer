@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 from extractor import extract_tasks
-from docx_builder import build_docx, group_tasks, split_by_answer_type, split_large_tasks
+from docx_builder import build_docx, group_tasks, split_large_tasks
 
 
 PROJ_OGE_MATH = "DE0E276E497AB3784C3FC4CC20248DC0"
@@ -42,8 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="proj GUID банка (по умолчанию — ОГЭ математика)")
     s.add_argument("--n", type=int, default=20, help="Сколько задач взять")
     s.add_argument("--per-page", type=int, default=0, choices=[0, 4, 6],
-                   help="0 = высота карточки по контенту (плотно, по умолчанию); "
-                        "4 = минимум 9 см (4 на лист); 6 = минимум 6 см (6 на лист)")
+                   help="оставлено для совместимости; высота карточек теперь авто, без растягивания")
     s.add_argument("--out-dir", type=Path, default=Path("data/output"))
     s.add_argument("--out-name", default="oge_math_sample",
                    help="префикс имён файлов (.docx и -extended.docx)")
@@ -63,26 +62,23 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     tasks = group_tasks(tasks)
-    short, extended = split_by_answer_type(tasks)
-    regular, large = split_large_tasks(short)
+    regular, large = split_large_tasks(tasks)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     short_path = args.out_dir / f"{args.out_name}.docx"
     large_path = args.out_dir / f"{args.out_name}-large.docx"
-    ext_path = args.out_dir / f"{args.out_name}-extended.docx"
 
     if regular:
         build_docx(regular, short_path, with_answer_squares=True, per_page=args.per_page)
     if large:
-        # Крупные карточки не кладём в общий файл на 6 карточек: они ломают
-        # печатную раскладку. В отдельном файле даём им больше места.
-        build_docx(large, large_path, with_answer_squares=True, per_page=4)
-    if extended:
-        build_docx(extended, ext_path, with_answer_squares=False, per_page=args.per_page)
+        # Крупные карточки не кладём в основной файл: они ломают печатную
+        # раскладку. Но поле ответа оставляем таким же, как в обычных карточках.
+        build_docx(large, large_path, with_answer_squares=True, per_page=args.per_page)
 
+    extended_count = sum(1 for t in tasks if t.answer_type == "extended")
     print(
-        f"[main] готово: {len(regular)} коротких, {len(large)} крупных, "
-        f"{len(extended)} развёрнутых",
+        f"[main] готово: {len(regular)} обычных, {len(large)} крупных, "
+        f"{extended_count} развёрнутых внутри общих файлов",
         file=sys.stderr,
     )
     return 0

@@ -488,8 +488,26 @@ def clean_chunks(chunks: list[Chunk]) -> list[Chunk]:
         else:
             cleaned.append(c)
 
-    # Убрать ведущие break'ы и чисто-пробельные тексты в начале
-    while cleaned and (cleaned[0].kind == "break" or
-                       (cleaned[0].kind == "text" and not cleaned[0].value.strip())):
-        cleaned.pop(0)
-    return cleaned
+    # Схлопнуть подряд идущие переносы: ФИПИ даёт много TABLE/TR/DIV,
+    # из-за чего в Word появлялись огромные пустые зоны внутри карточек.
+    compact: list[Chunk] = []
+    prev_break = False
+    for c in cleaned:
+        if c.kind == "break":
+            if not prev_break:
+                compact.append(c)
+            prev_break = True
+        else:
+            compact.append(c)
+            # После картинки новый абзац создаёт builder, поэтому соседние
+            # break'и не должны превращаться в дополнительные пустые строки.
+            prev_break = c.kind == "image"
+
+    # Убрать ведущие/концевые break'ы и чисто-пробельные тексты
+    while compact and (compact[0].kind == "break" or
+                       (compact[0].kind == "text" and not compact[0].value.strip())):
+        compact.pop(0)
+    while compact and (compact[-1].kind == "break" or
+                       (compact[-1].kind == "text" and not compact[-1].value.strip())):
+        compact.pop()
+    return compact
